@@ -88,7 +88,7 @@ public sealed class SentenceDispatchBuffer
         for (int i = 0; i < s.Length; i++)
         {
             char c = s[i];
-            if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '…')
+            if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '…' || c == ',')
                 return i;
         }
         return -1;

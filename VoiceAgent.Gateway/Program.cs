@@ -60,10 +60,9 @@ app.Map("/ws", async context =>
     // ===== TTS worker (Piper via WSL) =====
     var tts = new TtsWorker(
         ws,
-        piperExeWsl: "/home/adv/piper/piper",
+        piperExeWsl: "/home/adv/bin/piper/piper",
         modelWsl: "/home/adv/tts/ru_RU-irina-medium.onnx",
         configWsl: "/home/adv/tts/ru_RU-irina-medium.onnx.json");
-
     tts.Start();
 
     // ===== ASR gRPC =====
@@ -92,10 +91,10 @@ app.Map("/ws", async context =>
         Console.WriteLine($"[LLM] Cancel reason={reason}");
     }
 
-    CancellationTokenSource StartNewTurn(string reason, out long newTurn)
+    CancellationTokenSource StartNewTurn(string reason, out int newTurn)
     {
         Interlocked.Increment(ref turnId);
-        newTurn = Interlocked.Read(ref turnId);
+        newTurn = (int)Interlocked.Read(ref turnId);
 
         CancelLlm($"new_turn:{reason}");
 
@@ -145,6 +144,7 @@ app.Map("/ws", async context =>
 
                 var cts = StartNewTurn("asr_final", out var localTurn);
                 var buffer = sentenceBuffer!;
+                tts.StartNewTurn(localTurn);
                 var ollama = context.RequestServices.GetRequiredService<OllamaStreamer>();
 
                 // ---- consumer: sentences → TTS ----

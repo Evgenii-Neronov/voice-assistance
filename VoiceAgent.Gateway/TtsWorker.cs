@@ -252,4 +252,14 @@ public sealed class TtsWorker : IAsyncDisposable
         return msg.Length <= max ? msg : msg.Substring(0, max) + "...";
     }
 
+    public void StartNewTurn(int turnId)
+    {
+        _currentTurnId = turnId;
+        while (_q.TryDequeue(out _)) { }
+
+        Console.WriteLine($"[TTS] New turn started turnId={turnId}");
+        _ = WsSendTextSafeAsync($"METRIC:TTS_NEW_TURN turnId={turnId}");
+    }
+
+
 }

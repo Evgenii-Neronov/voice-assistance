@@ -1,7 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Text;
 using System.Net.WebSockets;
+using System.Text;
 
 namespace VoiceAgent.Tts;
 
@@ -16,7 +16,7 @@ public sealed class TtsWorker : IAsyncDisposable
     private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _cts = new();
 
-    private volatile int _currentTurnId = 0;
+    private long _currentTurnId = 0;
 
     public TtsWorker(WebSocket ws, string piperExeWsl, string modelWsl, string configWsl)
     {
@@ -28,28 +28,36 @@ public sealed class TtsWorker : IAsyncDisposable
 
     public void Start()
     {
+        Console.WriteLine("[TTS] Worker started");
         _ = Task.Run(LoopAsync);
     }
 
     public void Enqueue(long turnId, string sentence)
     {
         if (string.IsNullOrWhiteSpace(sentence)) return;
-        _q.Enqueue((turnId, sentence.Trim()));
+
+        var text = sentence.Trim();
+        _q.Enqueue((turnId, text));
         _signal.Release();
+
+        Console.WriteLine($"[TTS] Enqueue turnId={turnId} len={text.Length}");
+        _ = WsSendTextSafeAsync($"METRIC:TTS_ENQUEUE turnId={turnId} len={text.Length}");
     }
 
-    public void Stop(int newTurnId, string reason)
+    public void Stop(long newTurnId, string reason)
     {
-        _currentTurnId = newTurnId; // всё старое станет "stale"
-        // чистим очередь
+        _currentTurnId = newTurnId; // всё старое станет stale
+
         while (_q.TryDequeue(out _)) { }
-        // UI пусть остановит проигрывание
-        _ = WsSendTextSafeAsync($"TTS_STOP");
-        _ = WsSendTextSafeAsync($"METRIC:TTS_STOP reason={reason}");
+
+        Console.WriteLine($"[TTS] Stop reason={reason} newTurnId={newTurnId} queue_cleared");
+        _ = WsSendTextSafeAsync("TTS_STOP");
+        _ = WsSendTextSafeAsync($"METRIC:TTS_STOP reason={reason} newTurnId={newTurnId}");
     }
 
     public async ValueTask DisposeAsync()
     {
+        Console.WriteLine("[TTS] Dispose requested");
         _cts.Cancel();
         try { _signal.Release(); } catch { }
         _signal.Dispose();
@@ -74,51 +82,97 @@ public sealed class TtsWorker : IAsyncDisposable
             {
                 var (turnId, text) = item;
 
-                // если turn уже сменился (barge-in) — пропускаем
-                if (turnId != _currentTurnId && _currentTurnId != 0)
+                if (IsStale(turnId))
+                {
+                    Console.WriteLine($"[TTS] Drop stale item turnId={turnId} current={_currentTurnId}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_DROP_STALE turnId={turnId} current={_currentTurnId}");
                     continue;
+                }
 
-                // лог в UI
+                Console.WriteLine($"[TTS] Dequeue turnId={turnId} len={text.Length}");
                 await WsSendTextSafeAsync($"TTS_TEXT:{text}");
 
-                // synth
-                byte[]? wav = null;
+                // ---- synth ----
+                byte[]? wav;
+                var sw = Stopwatch.StartNew();
                 try
                 {
+                    Console.WriteLine($"[TTS] Synth start turnId={turnId}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_SYNTH_START turnId={turnId}");
+
                     wav = await SynthesizeWithPiperInWslAsync(text, _cts.Token);
+
+                    sw.Stop();
+                    Console.WriteLine($"[TTS] Synth done turnId={turnId} wavBytes={wav.Length} ms={sw.ElapsedMilliseconds}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_SYNTH_DONE turnId={turnId} wav_bytes={wav.Length} ms={sw.ElapsedMilliseconds}");
                 }
                 catch (Exception ex)
                 {
-                    await WsSendTextSafeAsync($"METRIC:TTS_ERROR {ex.Message}");
+                    sw.Stop();
+                    Console.WriteLine($"[TTS] Synth ERROR turnId={turnId} ms={sw.ElapsedMilliseconds} err={ex.Message}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_ERROR turnId={turnId} ms={sw.ElapsedMilliseconds} err={ex.Message}");
+                    continue;
                 }
 
                 if (wav == null || wav.Length == 0)
+                {
+                    Console.WriteLine($"[TTS] Empty wav turnId={turnId}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_EMPTY_WAV turnId={turnId}");
                     continue;
+                }
 
-                // если turn сменился пока синтезили — не шлём
-                if (turnId != _currentTurnId && _currentTurnId != 0)
+                if (IsStale(turnId))
+                {
+                    Console.WriteLine($"[TTS] Drop wav (stale after synth) turnId={turnId} current={_currentTurnId}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_DROP_STALE_AFTER_SYNTH turnId={turnId} current={_currentTurnId}");
                     continue;
+                }
 
-                // отправляем WAV как base64 (MVP)
+                // ---- send base64 wav ----
                 var b64 = Convert.ToBase64String(wav);
-                await WsSendTextSafeAsync($"TTS_WAV_BASE64:{b64}");
+                Console.WriteLine($"[TTS] base64 prepared turnId={turnId} b64Len={b64.Length} (~{b64.Length / 1024}KB)");
+                await WsSendTextSafeAsync($"METRIC:TTS_B64_READY turnId={turnId} b64_len={b64.Length}");
+
+                // (ВАЖНО) большое сообщение — отправляем, и логируем факт отправки/ошибку
+                var payload = "TTS_WAV_BASE64:" + b64;
+
+                var sendSw = Stopwatch.StartNew();
+                var ok = await WsSendTextSafeAsync(payload);
+                sendSw.Stop();
+
+                if (ok)
+                {
+                    Console.WriteLine($"[TTS] Sent TTS_WAV_BASE64 turnId={turnId} bytes={(payload.Length)} ms={sendSw.ElapsedMilliseconds}");
+                    await WsSendTextSafeAsync($"METRIC:TTS_SENT turnId={turnId} chars={payload.Length} ms={sendSw.ElapsedMilliseconds}");
+                }
+                else
+                {
+                    Console.WriteLine($"[TTS] Send failed (ws closed?) turnId={turnId}");
+                    // WsSendTextSafeAsync уже пишет METRIC при исключениях ниже, но оставим явный маркер
+                    await WsSendTextSafeAsync($"METRIC:TTS_SEND_FAILED turnId={turnId} ws_state={_ws.State}");
+                }
             }
         }
+
+        Console.WriteLine("[TTS] Loop finished");
+    }
+
+    private bool IsStale(long turnId)
+    {
+        var cur = _currentTurnId;
+        return cur != 0 && turnId != cur;
     }
 
     private async Task<byte[]> SynthesizeWithPiperInWslAsync(string text, CancellationToken ct)
     {
-        // Пишем WAV в temp Windows, чтобы WSL мог в /mnt/c/...
         var tmp = Path.Combine(Path.GetTempPath(), $"voiceagent_tts_{Guid.NewGuid():N}.wav");
-
         var wslPath = ToWslPath(tmp);
 
-        // Чтобы не мучаться с quoting русских строк — передаём base64 внутрь bash
+        // русскую строку безопасно передаём base64 -> base64 -d
         var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
 
-        // Команда:
-        // echo '<b64>' | base64 -d | piper --model ... --config ... --output_file <wslPath>
-        var bash = $"echo '{b64}' | base64 -d | '{_piperExeWsl}' --model '{_modelWsl}' --config '{_configWsl}' --output_file '{wslPath}'";
+        var bash =
+            $"echo '{b64}' | base64 -d | '{_piperExeWsl}' --model '{_modelWsl}' --config '{_configWsl}' --output_file '{wslPath}'";
 
         var psi = new ProcessStartInfo
         {
@@ -131,6 +185,7 @@ public sealed class TtsWorker : IAsyncDisposable
         };
 
         using var p = Process.Start(psi) ?? throw new Exception("Failed to start wsl.exe");
+
         var stderrTask = p.StandardError.ReadToEndAsync();
         var stdoutTask = p.StandardOutput.ReadToEndAsync();
 
@@ -149,7 +204,6 @@ public sealed class TtsWorker : IAsyncDisposable
 
     private static string ToWslPath(string winPath)
     {
-        // C:\Users\...\file.wav -> /mnt/c/Users/.../file.wav
         var p = winPath.Replace('\\', '/');
         if (p.Length >= 2 && p[1] == ':')
         {
@@ -159,14 +213,43 @@ public sealed class TtsWorker : IAsyncDisposable
         return p;
     }
 
-    private async Task WsSendTextSafeAsync(string msg)
+    // ✅ возвращаем bool + логируем ошибки/состояние
+    private async Task<bool> WsSendTextSafeAsync(string msg)
     {
-        if (_ws.State != WebSocketState.Open) return;
-        var bytes = Encoding.UTF8.GetBytes(msg);
+        if (_ws.State != WebSocketState.Open)
+        {
+            Console.WriteLine($"[TTS][WS] Skip send (state={_ws.State}) msgPrefix={Preview(msg)}");
+            return false;
+        }
+
         try
         {
+            var bytes = Encoding.UTF8.GetBytes(msg);
             await _ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+            return true;
         }
-        catch { /* ignore */ }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[TTS][WS] Send ERROR state={_ws.State} err={ex.Message} msgPrefix={Preview(msg)}");
+            // пробуем ещё и в UI метрику, если вдруг канал жив
+            try
+            {
+                var m = $"METRIC:TTS_WS_SEND_ERROR err={ex.Message}";
+                var b = Encoding.UTF8.GetBytes(m);
+                if (_ws.State == WebSocketState.Open)
+                    await _ws.SendAsync(b, WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            catch { /* ignore */ }
+
+            return false;
+        }
     }
+
+    private static string Preview(string msg)
+    {
+        // чтобы случайно не печатать гигантский base64 в консоль
+        const int max = 40;
+        return msg.Length <= max ? msg : msg.Substring(0, max) + "...";
+    }
+
 }

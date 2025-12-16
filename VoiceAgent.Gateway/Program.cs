@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using System.Net.WebSockets;
 using System.Text;
 using Google.Protobuf;
@@ -12,19 +11,14 @@ using Grpc.Core;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// =========================
 // SERVICES
-// =========================
 builder.Services.AddHttpClient<OllamaStreamer>();
 
 var app = builder.Build();
 
-// =========================
-// HOST LIFETIME (Ctrl+C)
-// =========================
+// Ctrl+C
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 var shutdownCts = new CancellationTokenSource();
-
 lifetime.ApplicationStopping.Register(() =>
 {
     Console.WriteLine("[HOST] Ctrl+C → shutdown");
@@ -35,18 +29,12 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 app.UseWebSockets();
 
-// =========================
-// HELPERS
-// =========================
 static Task WsSend(WebSocket ws, string msg, CancellationToken ct)
 {
     var bytes = Encoding.UTF8.GetBytes(msg);
     return ws.SendAsync(bytes, WebSocketMessageType.Text, true, ct);
 }
 
-// =========================
-// WS ENDPOINT
-// =========================
 app.Map("/ws", async ctx =>
 {
     var shutdown = shutdownCts.Token;
@@ -61,11 +49,29 @@ app.Map("/ws", async ctx =>
     Console.WriteLine("[WS] connected");
 
     // =========================
+    // DIALOG HISTORY + PROMPT
+    // =========================
+    // Храним последние turn'ы (можно увеличить)
+    var dialogHistory = new List<TurnState>(capacity: 64);
+
+    // System prompt (один на всё)
+    const string SystemPrompt = """
+Ты голосовой помощник.
+Отвечай разговорно и кратко.
+Не используй markdown, списки, эмодзи, спецсимволы.
+Избегай кавычек, скобок, двоеточий в середине фраз.
+Пиши обычным текстом.
+Если тебя прервали речью пользователя, не извиняйся и не упоминай прерывание.
+Если пользователь продолжает мысль, учитывай предыдущие реплики.
+""";
+
+    var promptBuilder = new DialogPromptBuilder(SystemPrompt, maxTurns: 10, maxChars: 12_000);
+
+    // =========================
     // STATE
     // =========================
     long turnSeq = 0;
     TurnState? currentTurn = null;
-
     CancellationTokenSource? llmCts = null;
 
     // =========================
@@ -88,24 +94,31 @@ app.Map("/ws", async ctx =>
 
     void CancelLlm(string reason)
     {
-        llmCts?.Cancel();
-        llmCts?.Dispose();
+        try
+        {
+            llmCts?.Cancel();
+            llmCts?.Dispose();
+        }
+        catch { /* ignore */ }
+
         llmCts = null;
 
         currentTurn?.Assistant.MarkInterrupted();
-
         Console.WriteLine($"[LLM] cancel ({reason})");
     }
 
     async Task BargeIn(string reason)
     {
-        Interlocked.Increment(ref turnSeq);
+        // барж-ин = новая “эпоха”: увеличиваем счетчик turnSeq
+        var newSeq = Interlocked.Increment(ref turnSeq);
 
         CancelLlm(reason);
 
         currentTurn?.User.MarkInterrupted();
 
-        tts.Stop(currentTurn?.TurnId ?? 0, reason);
+        // Важно: синхронизировать TTS-guard с новым turnSeq,
+        // иначе очередь будет считаться stale.
+        tts.Stop(newSeq, reason);
 
         await WsSend(ws, "BARGE_IN_ACK", shutdown);
         await WsSend(ws, "TTS_STOP", shutdown);
@@ -116,71 +129,101 @@ app.Map("/ws", async ctx =>
     // =========================
     _ = Task.Run(async () =>
     {
-        await foreach (var res in asrCall.ResponseStream.ReadAllAsync())
+        try
         {
-            if (ws.State != WebSocketState.Open) break;
-
-            if (!res.IsFinal)
+            await foreach (var res in asrCall.ResponseStream.ReadAllAsync(shutdown))
             {
-                currentTurn?.User.AppendPartial(res.Text);
-                await WsSend(ws, $"ASR_PART:{res.Text}", shutdown);
-                continue;
-            }
+                if (ws.State != WebSocketState.Open) break;
 
-            // ⭐ ASR FINAL → новый turn
-            var turnId = Interlocked.Increment(ref turnSeq);
-            currentTurn = new TurnState(turnId);
-            tts.StartTurn(turnId);
-            currentTurn.User.MarkFinal(res.Text);
-
-            await WsSend(ws, $"ASR_FINAL:{res.Text}", shutdown);
-
-            CancelLlm("new_turn");
-
-            llmCts = new CancellationTokenSource();
-            var localTurn = currentTurn;
-            var ollama = ctx.RequestServices.GetRequiredService<OllamaStreamer>();
-
-            // =========================
-            // LLM STREAM
-            // =========================
-            var buffer = new SentenceDispatchBuffer();
-            _ = Task.Run(async () =>
-            {
-                try
+                if (!res.IsFinal)
                 {
-                    await foreach (var token in ollama.StreamAsync(res.Text, llmCts.Token))
+                    currentTurn?.User.AppendPartial(res.Text);
+                    await WsSend(ws, $"ASR_PART:{res.Text}", shutdown);
+                    continue;
+                }
+
+                // ===== ASR FINAL => новый turn =====
+                var turnId = Interlocked.Increment(ref turnSeq);
+
+                // Создаём новый turn state
+                currentTurn = new TurnState(turnId);
+                currentTurn.User.MarkFinal(res.Text);
+
+                // Сохраняем в историю
+                dialogHistory.Add(currentTurn);
+
+                // Ограничим рост памяти
+                if (dialogHistory.Count > 50)
+                    dialogHistory.RemoveRange(0, dialogHistory.Count - 50);
+
+                await WsSend(ws, $"ASR_FINAL:{res.Text}", shutdown);
+
+                // новый turn => отменяем прошлый LLM
+                CancelLlm("new_turn");
+
+                // Для stale-логики TTS: объявляем старт turn'а
+                tts.StartTurn(turnId);
+
+                llmCts = new CancellationTokenSource();
+                var localTurn = currentTurn;
+                var ollama = ctx.RequestServices.GetRequiredService<OllamaStreamer>();
+
+                // ===== PROMPT из истории =====
+                var prompt = promptBuilder.Build(dialogHistory, res.Text);
+
+                // ===== STREAM =====
+                var buffer = new SentenceDispatchBuffer();
+
+                // Consumer: предложения -> TTS
+                _ = Task.Run(async () =>
+                {
+                    try
                     {
-                        if (localTurn != currentTurn) break;
+                        await foreach (var sentence in buffer.GetSentencesAsync(llmCts.Token))
+                        {
+                            if (localTurn != currentTurn) break;
 
-                        localTurn.Assistant.AppendLlmToken(token);
-                        await WsSend(ws, $"LLM_PART:{token}", shutdown);
+                            localTurn.Assistant.AppendSpokenSentence(sentence);
 
-             
-                        buffer.AppendToken(token);
+                            // очередь в TTS
+                            tts.Enqueue(localTurn.TurnId, sentence);
+                        }
                     }
-                    buffer.Complete();
+                    catch (OperationCanceledException) { }
+                });
 
-                    await WsSend(ws, "LLM_FINAL", shutdown);
-                }
-                catch (OperationCanceledException) { }
-            });
-
-            // =========================
-            // SENTENCE → TTS
-            // =========================
-            
-
-            _ = Task.Run(async () =>
-            {
-                await foreach (var sentence in buffer.GetSentencesAsync(llmCts.Token))
+                // Producer: токены -> UI + buffer + TurnState
+                _ = Task.Run(async () =>
                 {
-                    if (localTurn != currentTurn) break;
+                    try
+                    {
+                        await foreach (var token in ollama.StreamAsync(prompt, llmCts.Token))
+                        {
+                            if (localTurn != currentTurn) break;
 
-                    localTurn.Assistant.AppendSpokenSentence(sentence);
-                    tts.Enqueue((int)localTurn.TurnId, sentence);
-                }
-            });
+                            localTurn.Assistant.AppendLlmToken(token);
+
+                            // UI текстом (под эквалайзером)
+                            await WsSend(ws, $"LLM_PART:{token}", shutdown);
+
+                            // сплит в предложения
+                            buffer.AppendToken(token);
+                        }
+
+                        // финальный хвост
+                        buffer.Complete();
+
+                        if (localTurn == currentTurn)
+                            await WsSend(ws, "LLM_FINAL", shutdown);
+                    }
+                    catch (OperationCanceledException) { }
+                });
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ASR] stream error: {ex.Message}");
         }
     });
 
@@ -202,10 +245,20 @@ app.Map("/ws", async ctx =>
                 var cmd = Encoding.UTF8.GetString(buf, 0, r.Count).Trim();
 
                 if (cmd == "barge_in")
+                {
                     await BargeIn("vad");
-
-                if (cmd == "reset")
+                    // Важно: ресетим ASR, чтобы “склеек” не было
+                    await asrCall.RequestStream.WriteAsync(new AudioChunk { Reset = true });
+                }
+                else if (cmd == "reset")
+                {
                     await BargeIn("reset");
+                    await asrCall.RequestStream.WriteAsync(new AudioChunk { Reset = true });
+                }
+                else if (cmd == "end")
+                {
+                    await asrCall.RequestStream.WriteAsync(new AudioChunk { End = true });
+                }
 
                 continue;
             }
@@ -213,19 +266,18 @@ app.Map("/ws", async ctx =>
             if (r.MessageType == WebSocketMessageType.Binary)
             {
                 await asrCall.RequestStream.WriteAsync(
-                    new AudioChunk
-                    {
-                        Pcm16Le = ByteString.CopyFrom(buf, 0, r.Count)
-                    });
+                    new AudioChunk { Pcm16Le = ByteString.CopyFrom(buf, 0, r.Count) });
             }
         }
     }
     finally
     {
         Console.WriteLine("[WS] disconnected");
+
         CancelLlm("ws_close");
 
         ArrayPool<byte>.Shared.Return(buf);
+
         try { await asrCall.RequestStream.CompleteAsync(); } catch { }
     }
 });

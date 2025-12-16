@@ -1,191 +1,172 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
-using System.Threading.Channels;
+using System.Net.WebSockets;
 
 namespace VoiceAgent.Tts;
 
-/// <summary>
-/// Последовательный TTS-воркер.
-///  - принимает предложения
-///  - озвучивает строго по очереди
-///  - корректно отменяется (barge-in)
-/// </summary>
-public sealed class TtsWorker : IDisposable
+public sealed class TtsWorker : IAsyncDisposable
 {
-    private readonly Channel<TtsItem> _queue;
+    private readonly WebSocket _ws;
+    private readonly string _piperExeWsl;   // например: /home/adv/piper/piper
+    private readonly string _modelWsl;      // например: /home/adv/tts/ru_RU-irina-medium.onnx
+    private readonly string _configWsl;     // например: /home/adv/tts/ru_RU-irina-medium.onnx.json
+
+    private readonly ConcurrentQueue<(long TurnId, string Text)> _q = new();
+    private readonly SemaphoreSlim _signal = new(0);
     private readonly CancellationTokenSource _cts = new();
-    private readonly Task _loopTask;
 
-    private readonly string _piperExe;
-    private readonly string _modelPath;
-    private readonly string _configPath;
-    private readonly string _outputDir;
+    private volatile int _currentTurnId = 0;
 
-    public TtsWorker(
-        string piperExe,
-        string modelPath,
-        string configPath,
-        string outputDir)
+    public TtsWorker(WebSocket ws, string piperExeWsl, string modelWsl, string configWsl)
     {
-        _piperExe = piperExe;
-        _modelPath = modelPath;
-        _configPath = configPath;
-        _outputDir = outputDir;
-
-        Directory.CreateDirectory(_outputDir);
-
-        _queue = Channel.CreateUnbounded<TtsItem>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
-
-        _loopTask = Task.Run(ProcessLoopAsync);
+        _ws = ws;
+        _piperExeWsl = piperExeWsl;
+        _modelWsl = modelWsl;
+        _configWsl = configWsl;
     }
 
-    // =========================
-    // PUBLIC API
-    // =========================
-
-    /// <summary>
-    /// Добавить предложение в очередь озвучки
-    /// </summary>
-    public void Enqueue(string text, CancellationToken ct)
+    public void Start()
     {
-        if (string.IsNullOrWhiteSpace(text))
-            return;
-
-        var item = new TtsItem(text.Trim(), ct);
-        _queue.Writer.TryWrite(item);
+        _ = Task.Run(LoopAsync);
     }
 
-    /// <summary>
-    /// Полный сброс очереди (barge-in)
-    /// </summary>
-    public void Reset()
+    public void Enqueue(long turnId, string sentence)
     {
-        Console.WriteLine("[TTS] Reset queue");
-
-        while (_queue.Reader.TryRead(out _)) { }
+        if (string.IsNullOrWhiteSpace(sentence)) return;
+        _q.Enqueue((turnId, sentence.Trim()));
+        _signal.Release();
     }
 
-    public void Dispose()
+    public void Stop(int newTurnId, string reason)
+    {
+        _currentTurnId = newTurnId; // всё старое станет "stale"
+        // чистим очередь
+        while (_q.TryDequeue(out _)) { }
+        // UI пусть остановит проигрывание
+        _ = WsSendTextSafeAsync($"TTS_STOP");
+        _ = WsSendTextSafeAsync($"METRIC:TTS_STOP reason={reason}");
+    }
+
+    public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
-        _queue.Writer.TryComplete();
-
-        try { _loopTask.Wait(); } catch { }
+        try { _signal.Release(); } catch { }
+        _signal.Dispose();
+        _cts.Dispose();
+        await Task.CompletedTask;
     }
 
-    // =========================
-    // WORK LOOP
-    // =========================
-
-    private async Task ProcessLoopAsync()
+    private async Task LoopAsync()
     {
-        Console.WriteLine("[TTS] Worker started");
-
-        try
+        while (!_cts.IsCancellationRequested)
         {
-            while (await _queue.Reader.WaitToReadAsync(_cts.Token))
+            try
             {
-                while (_queue.Reader.TryRead(out var item))
-                {
-                    if (item.CancellationToken.IsCancellationRequested)
-                    {
-                        Console.WriteLine("[TTS] Skip canceled item");
-                        continue;
-                    }
+                await _signal.WaitAsync(_cts.Token);
+            }
+            catch
+            {
+                break;
+            }
 
-                    await SpeakAsync(item);
+            while (_q.TryDequeue(out var item))
+            {
+                var (turnId, text) = item;
+
+                // если turn уже сменился (barge-in) — пропускаем
+                if (turnId != _currentTurnId && _currentTurnId != 0)
+                    continue;
+
+                // лог в UI
+                await WsSendTextSafeAsync($"TTS_TEXT:{text}");
+
+                // synth
+                byte[]? wav = null;
+                try
+                {
+                    wav = await SynthesizeWithPiperInWslAsync(text, _cts.Token);
                 }
+                catch (Exception ex)
+                {
+                    await WsSendTextSafeAsync($"METRIC:TTS_ERROR {ex.Message}");
+                }
+
+                if (wav == null || wav.Length == 0)
+                    continue;
+
+                // если turn сменился пока синтезили — не шлём
+                if (turnId != _currentTurnId && _currentTurnId != 0)
+                    continue;
+
+                // отправляем WAV как base64 (MVP)
+                var b64 = Convert.ToBase64String(wav);
+                await WsSendTextSafeAsync($"TTS_WAV_BASE64:{b64}");
             }
         }
-        catch (OperationCanceledException)
-        {
-            // normal shutdown
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[TTS] Fatal error: {ex}");
-        }
-        finally
-        {
-            Console.WriteLine("[TTS] Worker stopped");
-        }
     }
 
-    // =========================
-    // PIPER INVOCATION
-    // =========================
-
-    private async Task SpeakAsync(TtsItem item)
+    private async Task<byte[]> SynthesizeWithPiperInWslAsync(string text, CancellationToken ct)
     {
-        var text = item.Text;
-        var ct = item.CancellationToken;
+        // Пишем WAV в temp Windows, чтобы WSL мог в /mnt/c/...
+        var tmp = Path.Combine(Path.GetTempPath(), $"voiceagent_tts_{Guid.NewGuid():N}.wav");
 
-        var fileName = $"{DateTime.UtcNow:HHmmssfff}_{Guid.NewGuid():N}.wav";
-        var outPath = Path.Combine(_outputDir, fileName);
+        var wslPath = ToWslPath(tmp);
 
-        Console.WriteLine($"[TTS] Speak: \"{text}\"");
+        // Чтобы не мучаться с quoting русских строк — передаём base64 внутрь bash
+        var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(text));
+
+        // Команда:
+        // echo '<b64>' | base64 -d | piper --model ... --config ... --output_file <wslPath>
+        var bash = $"echo '{b64}' | base64 -d | '{_piperExeWsl}' --model '{_modelWsl}' --config '{_configWsl}' --output_file '{wslPath}'";
 
         var psi = new ProcessStartInfo
         {
-            FileName = _piperExe,
-            Arguments =
-                $"--model \"{_modelPath}\" " +
-                $"--config \"{_configPath}\" " +
-                $"--output_file \"{outPath}\"",
-            RedirectStandardInput = true,
+            FileName = "wsl.exe",
+            Arguments = $"bash -lc \"{bash}\"",
             RedirectStandardError = true,
+            RedirectStandardOutput = true,
             UseShellExecute = false,
             CreateNoWindow = true
         };
 
-        using var proc = new Process { StartInfo = psi };
+        using var p = Process.Start(psi) ?? throw new Exception("Failed to start wsl.exe");
+        var stderrTask = p.StandardError.ReadToEndAsync();
+        var stdoutTask = p.StandardOutput.ReadToEndAsync();
 
-        proc.Start();
+        await p.WaitForExitAsync(ct);
 
-        await proc.StandardInput.WriteAsync(text);
-        await proc.StandardInput.FlushAsync();
-        proc.StandardInput.Close();
+        var stderr = await stderrTask;
+        _ = await stdoutTask;
 
-        using var reg = ct.Register(() =>
-        {
-            try
-            {
-                if (!proc.HasExited)
-                {
-                    Console.WriteLine("[TTS] Killing piper (barge-in)");
-                    proc.Kill(entireProcessTree: true);
-                }
-            }
-            catch { }
-        });
+        if (p.ExitCode != 0)
+            throw new Exception($"piper failed exit={p.ExitCode} err={stderr.Trim()}");
 
-        var stderr = await proc.StandardError.ReadToEndAsync();
-        await proc.WaitForExitAsync(ct);
-
-        if (proc.ExitCode != 0)
-        {
-            Console.WriteLine($"[TTS] Piper error: {stderr}");
-            return;
-        }
-
-        Console.WriteLine($"[TTS] Done → {outPath}");
-
-        // TODO:
-        //  - отправить WAV в браузер
-        //  - или декодировать и стримить PCM
+        var wav = await File.ReadAllBytesAsync(tmp, ct);
+        try { File.Delete(tmp); } catch { }
+        return wav;
     }
 
-    // =========================
-    // INTERNAL TYPES
-    // =========================
+    private static string ToWslPath(string winPath)
+    {
+        // C:\Users\...\file.wav -> /mnt/c/Users/.../file.wav
+        var p = winPath.Replace('\\', '/');
+        if (p.Length >= 2 && p[1] == ':')
+        {
+            var drive = char.ToLowerInvariant(p[0]);
+            p = $"/mnt/{drive}{p.Substring(2)}";
+        }
+        return p;
+    }
 
-    private sealed record TtsItem(
-        string Text,
-        CancellationToken CancellationToken
-    );
+    private async Task WsSendTextSafeAsync(string msg)
+    {
+        if (_ws.State != WebSocketState.Open) return;
+        var bytes = Encoding.UTF8.GetBytes(msg);
+        try
+        {
+            await _ws.SendAsync(bytes, WebSocketMessageType.Text, true, CancellationToken.None);
+        }
+        catch { /* ignore */ }
+    }
 }

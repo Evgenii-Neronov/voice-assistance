@@ -176,6 +176,45 @@
         let lastBargeInTs = 0;
         let llmFirstTokenSeenForTurn = false;
 
+        let ttsAudioCtx = null;
+        let ttsQueue = [];
+        let ttsPlaying = false;
+        let ttsCurrentSource = null;
+
+        function ttsStop() {
+            ttsQueue = [];
+            ttsPlaying = false;
+            try { ttsCurrentSource?.stop(); } catch { }
+            ttsCurrentSource = null;
+        }
+
+        async function ttsEnqueueWavBase64(b64) {
+            if (!ttsAudioCtx) ttsAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const buf = await ttsAudioCtx.decodeAudioData(bytes.buffer);
+            ttsQueue.push(buf);
+            if (!ttsPlaying) ttsPlayLoop();
+        }
+
+        async function ttsPlayLoop() {
+            ttsPlaying = true;
+            while (ttsQueue.length > 0) {
+                const buf = ttsQueue.shift();
+                const src = ttsAudioCtx.createBufferSource();
+                ttsCurrentSource = src;
+                src.buffer = buf;
+                src.connect(ttsAudioCtx.destination);
+
+                await new Promise(resolve => {
+                    src.onended = resolve;
+                    src.start();
+                });
+            }
+            ttsPlaying = false;
+            ttsCurrentSource = null;
+        }
+
+
         // === NEW: батчинг логов LLM_PART (чтобы таблица не умерла) ===
         let llmTokBuf = "";
         let llmTokFlushTimer = null;
@@ -330,8 +369,15 @@
                 }
 
                 if (msg === "TTS_STOP") {
-                    addLog("LLM", "TTS_STOP");
-                    flushLlmTokenLog(true);
+                    addLog("TTS", "TTS_STOP (очередь очищена)");
+                    ttsStop();
+                    return;
+                }
+
+                if (msg.startsWith("TTS_WAV_BASE64:")) {
+                    const b64 = msg.substring("TTS_WAV_BASE64:".length);
+                    addLog("TTS", `TTS_WAV получен (${Math.round(b64.length / 1024)} KB base64)`);
+                    ttsEnqueueWavBase64(b64);
                     return;
                 }
 

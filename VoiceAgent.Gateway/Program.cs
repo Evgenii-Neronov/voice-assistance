@@ -9,12 +9,22 @@ using VoiceAgent.Asr;
 using VoiceAgent.Gateway;
 using VoiceAgent.Tts;
 
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Ollama streaming client
 builder.Services.AddHttpClient<OllamaStreamer>();
 
 var app = builder.Build();
+
+var appLifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
+var shutdownCts = new CancellationTokenSource();
+
+appLifetime.ApplicationStopping.Register(() =>
+{
+    Console.WriteLine("[HOST] ApplicationStopping (Ctrl+C)");
+    shutdownCts.Cancel();
+});
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
@@ -33,6 +43,14 @@ static double MsBetween(long startStamp, long endStamp)
 
 app.Map("/ws", async context =>
 {
+    var shutdownToken = shutdownCts.Token;
+
+    if (!context.WebSockets.IsWebSocketRequest)
+    {
+        context.Response.StatusCode = 400;
+        return;
+    }
+
     if (!context.WebSockets.IsWebSocketRequest)
     {
         context.Response.StatusCode = 400;
@@ -42,55 +60,66 @@ app.Map("/ws", async context =>
     Console.WriteLine("[WS] Client connected");
     using var ws = await context.WebSockets.AcceptWebSocketAsync();
 
-    // gRPC ASR
+    // gRPC channel to ASR (local)
     var channel = GrpcChannel.ForAddress("http://localhost:50051");
     var asrClient = new Asr.AsrClient(channel);
     using var asrCall = asrClient.StreamRecognize();
 
-    // ===== TURN / CANCELLATION =====
+    // LLM cancellation + turn tracking
     CancellationTokenSource? llmCts = null;
-    SentenceDispatchBuffer? sentenceBuffer = null;
-
     long turnId = 0;
 
-    void CancelTurn(string reason)
+    // sentence buffer for current turn
+    SentenceDispatchBuffer? sentenceBuffer = null;
+
+    void CancelLlm(string reason)
     {
-        try { llmCts?.Cancel(); } catch { }
+        try
+        {
+            llmCts?.Cancel();
+            llmCts?.Dispose();
+        }
+        catch { /* ignore */ }
+
         llmCts = null;
 
         try { sentenceBuffer?.Reset(); } catch { }
         sentenceBuffer = null;
 
-        Console.WriteLine($"[TURN] Cancel reason={reason}");
+        Console.WriteLine($"[LLM] Cancel reason={reason}");
     }
 
-    CancellationTokenSource StartNewTurn(string reason, out long localTurn)
+    CancellationTokenSource StartNewLlmTurn(string reason, out long newTurnId)
     {
         Interlocked.Increment(ref turnId);
-        localTurn = Interlocked.Read(ref turnId);
+        newTurnId = Interlocked.Read(ref turnId);
 
-        CancelTurn($"new_turn:{reason}");
+        CancelLlm($"new_turn:{reason}");
 
         llmCts = new CancellationTokenSource();
-        sentenceBuffer = new SentenceDispatchBuffer();
+        sentenceBuffer = new SentenceDispatchBuffer(minSentenceLength: 30);
 
-        Console.WriteLine($"[TURN] Start turnId={localTurn} ({reason})");
+        Console.WriteLine($"[TURN] turnId={newTurnId} ({reason})");
         return llmCts;
     }
 
     async Task DoBargeInAsync(string reason)
     {
+        // new global turn => anything in-flight becomes stale
         Interlocked.Increment(ref turnId);
-        CancelTurn($"barge_in:{reason}");
+        var curTurn = Interlocked.Read(ref turnId);
 
-        Console.WriteLine($"[BARGE_IN] reason={reason}");
+        CancelLlm($"barge_in:{reason}");
 
-        try { await WsSendText(ws, "BARGE_IN_ACK"); } catch { }
-        try { await WsSendText(ws, "TTS_STOP"); } catch { }
-        try { await WsSendText(ws, "METRIC:LLM_CANCELED"); } catch { }
+        Console.WriteLine($"[BARGE_IN] reason={reason} -> turnId={curTurn}");
+
+        // notify UI (and later stop TTS)
+        try { await WsSendText(ws, "BARGE_IN_ACK", shutdownToken); } catch { }
+        try { await WsSendText(ws, "TTS_STOP", shutdownToken); } catch { }
+        try { await WsSendText(ws, "METRIC:LLM_CANCELED", shutdownToken); } catch { }
     }
 
-    // ===== ASR → LLM =====
+    // === ASR → Browser + ASR → LLM ===
     var asrReceiveTask = Task.Run(async () =>
     {
         try
@@ -102,43 +131,62 @@ app.Map("/ws", async context =>
 
                 if (!res.IsFinal)
                 {
-                    await WsSendText(ws, $"ASR_PART:{res.Text}");
+                    Console.WriteLine($"[ASR][PART] {res.Text}");
+                    await WsSendText(ws, $"ASR_PART:{res.Text}", shutdownToken);
                     continue;
                 }
 
-                // ASR FINAL
-                await WsSendText(ws, $"ASR_FINAL:{res.Text}");
-                await WsSendText(ws, "METRIC:ASR_FINAL");
+                // FINAL
+                Console.WriteLine($"[ASR][FINAL] {res.Text}");
+                await WsSendText(ws, $"ASR_FINAL:{res.Text}", shutdownToken);
 
+                // Anchor timestamp for metrics for THIS turn
                 var asrFinalStamp = Stopwatch.GetTimestamp();
+                try { await WsSendText(ws, "METRIC:ASR_FINAL", shutdownToken); } catch { }
 
-                var cts = StartNewTurn("asr_final", out var localTurn);
+                // Interrupt previous LLM and start new turn
+                var cts = StartNewLlmTurn("asr_final", out var localTurn);
                 var buffer = sentenceBuffer!;
+
+                Console.WriteLine($"[LLM] Start generation turnId={localTurn}");
+
                 var ollama = context.RequestServices.GetRequiredService<OllamaStreamer>();
 
-                // ===== SENTENCE → WS (+ future TTS) =====
+                // Consumer: sentences ready for TTS → UI log table as TTS_TEXT
                 _ = Task.Run(async () =>
                 {
-                    await foreach (var sentence in buffer.GetSentencesAsync(cts.Token))
+                    try
                     {
-                        if (localTurn != Interlocked.Read(ref turnId))
-                            break;
+                        await foreach (var sentence in buffer.GetSentencesAsync(cts.Token))
+                        {
+                            if (localTurn != Interlocked.Read(ref turnId))
+                                break;
 
-                        Console.WriteLine($"[TTS][QUEUE] {sentence}");
-                        await WsSendText(ws, $"LLM_PART:{sentence} ");
+                            Console.WriteLine($"[TTS_TEXT] {sentence}");
+                            await WsSendText(ws, $"TTS_TEXT:{sentence}", shutdownToken);
+
+                            // позже здесь:
+                            // ttsWorker.Enqueue(sentence, cts.Token);
+                        }
+                    }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[TTS_TEXT] consumer error: {ex.Message}");
                     }
                 });
 
-                // ===== LLM STREAM =====
+                // Producer: LLM tokens → UI + sentence buffer
                 _ = Task.Run(async () =>
                 {
-                    bool firstToken = true;
                     long firstTokenStamp = 0;
+                    bool firstToken = true;
 
                     try
                     {
                         await foreach (var token in ollama.StreamAsync(res.Text, cts.Token))
                         {
+                            // Stop emitting if barge-in/new turn happened
                             if (localTurn != Interlocked.Read(ref turnId))
                                 break;
 
@@ -146,58 +194,65 @@ app.Map("/ws", async context =>
                             {
                                 firstToken = false;
                                 firstTokenStamp = Stopwatch.GetTimestamp();
+
                                 var ms = MsBetween(asrFinalStamp, firstTokenStamp);
-                                await WsSendText(ws, $"METRIC:LLM_FIRST_TOKEN ms_from_asr_final={ms:F1}");
+                                Console.WriteLine($"[LLM] First token (turnId={localTurn}) +{ms:F1}ms");
+                                try { await WsSendText(ws, $"METRIC:LLM_FIRST_TOKEN ms_from_asr_final={ms:F1}", shutdownToken); } catch { }
                             }
 
-                            // ✅ 1) СРАЗУ отдаём токен в UI (как раньше)
-                            // Важно: отмена / stale turn автоматически оборвёт по cts.Token
+                            // ✅ 1) токен в UI (под эквалайзером)
                             await WsSendText(ws, $"LLM_PART:{token}", cts.Token);
 
-                            // ✅ 2) И параллельно кормим сплиттер, чтобы TTS получал предложения
+                            // ✅ 2) токен в буфер предложений
                             buffer.AppendToken(token);
                         }
 
+                        // If canceled or stale -> don't finalize
                         if (cts.IsCancellationRequested || localTurn != Interlocked.Read(ref turnId))
                             return;
 
+                        // ✅ закрываем поток предложений (consumer завершится)
                         buffer.Complete();
 
                         var endStamp = Stopwatch.GetTimestamp();
-                        var totalMs = MsBetween(asrFinalStamp, endStamp);
-                        var fromFirst = firstTokenStamp == 0 ? -1 : MsBetween(firstTokenStamp, endStamp);
+                        var msFromAsr = MsBetween(asrFinalStamp, endStamp);
+                        var msFromFirst = firstTokenStamp == 0 ? -1 : MsBetween(firstTokenStamp, endStamp);
 
-                        await WsSendText(
-                            ws,
-                            $"METRIC:LLM_FINAL ms_from_asr_final={totalMs:F1} ms_from_first_token={fromFirst:F1}"
-                        );
+                        Console.WriteLine($"[LLM] Generation finished (turnId={localTurn}) total={msFromAsr:F1}ms");
 
-                        await WsSendText(ws, "LLM_FINAL");
+                        try
+                        {
+                            await WsSendText(ws, $"METRIC:LLM_FINAL ms_from_asr_final={msFromAsr:F1} ms_from_first_token={msFromFirst:F1}", shutdownToken);
+                        }
+                        catch { }
+
+                        await WsSendText(ws, "LLM_FINAL", shutdownToken);
                     }
                     catch (OperationCanceledException)
                     {
-                        Console.WriteLine($"[LLM] canceled turnId={localTurn}");
+                        Console.WriteLine($"[LLM] Generation interrupted (turnId={localTurn})");
+                        try { await WsSendText(ws, "METRIC:LLM_CANCELED", shutdownToken); } catch { }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"[LLM] error {ex.Message}");
+                        Console.WriteLine($"[LLM] Error: {ex.Message}");
                     }
                 });
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[ASR] error {ex.Message}");
+            Console.WriteLine($"[ASR] Stream error: {ex.Message}");
         }
     });
 
-    // ===== WS → ASR / COMMANDS =====
+    // === Browser → ASR / Commands ===
     var bufferBytes = ArrayPool<byte>.Shared.Rent(64 * 1024);
     try
     {
-        while (ws.State == WebSocketState.Open)
+        while (ws.State == WebSocketState.Open && !shutdownToken.IsCancellationRequested)
         {
-            var result = await ws.ReceiveAsync(bufferBytes, CancellationToken.None);
+            var result = await ws.ReceiveAsync(bufferBytes, shutdownToken);
 
             if (result.MessageType == WebSocketMessageType.Close)
                 break;
@@ -205,19 +260,21 @@ app.Map("/ws", async context =>
             if (result.MessageType == WebSocketMessageType.Text)
             {
                 var cmd = Encoding.UTF8.GetString(bufferBytes, 0, result.Count).Trim();
+                Console.WriteLine($"[WS][CMD] {cmd}");
 
-                if (cmd == "reset")
+                if (cmd.Equals("reset", StringComparison.OrdinalIgnoreCase))
                 {
                     await DoBargeInAsync("reset_cmd");
                     await asrCall.RequestStream.WriteAsync(new AudioChunk { Reset = true });
                 }
-                else if (cmd == "barge_in")
-                {
-                    await DoBargeInAsync("vad_start");
-                }
-                else if (cmd == "end")
+                else if (cmd.Equals("end", StringComparison.OrdinalIgnoreCase))
                 {
                     await asrCall.RequestStream.WriteAsync(new AudioChunk { End = true });
+                }
+                else if (cmd.Equals("barge_in", StringComparison.OrdinalIgnoreCase))
+                {
+                    await DoBargeInAsync("vad_start");
+                    await asrCall.RequestStream.WriteAsync(new AudioChunk { Reset = true });
                 }
 
                 continue;
@@ -235,19 +292,16 @@ app.Map("/ws", async context =>
     }
     finally
     {
-        Console.WriteLine("[WS] disconnected");
+        Console.WriteLine("[WS] Client disconnected");
 
         ArrayPool<byte>.Shared.Return(bufferBytes);
-        CancelTurn("ws_disconnect");
+
+        CancelLlm("ws_disconnect");
 
         try { await asrCall.RequestStream.CompleteAsync(); } catch { }
         try { await asrReceiveTask; } catch { }
 
-        try
-        {
-            await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None);
-        }
-        catch { }
+        try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", shutdownToken); } catch { }
     }
 });
 

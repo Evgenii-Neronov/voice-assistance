@@ -1,133 +1,102 @@
 ﻿using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Channels;
 
 namespace VoiceAgent.Tts;
 
-/// <summary>
-/// Буфер, который принимает поток токенов от LLM,
-/// режет их на законченные предложения
-/// и отдаёт в виде асинхронной очереди.
-/// Поддерживает barge-in (Reset).
-/// </summary>
 public sealed class SentenceDispatchBuffer
 {
-    private readonly Channel<string> _channel;
-    private readonly StringBuilder _buffer = new();
-    private readonly object _lock = new();
+    private readonly StringBuilder _sb = new();
+    private readonly Channel<string> _out = Channel.CreateUnbounded<string>(
+        new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
 
     private readonly int _minSentenceLength;
-    private bool _completed;
-
-    // конец фразы: . ! ? … или перевод строки
-    private static readonly Regex SentenceEndRegex =
-        new(@"[.!?\n…]+", RegexOptions.Compiled);
 
     public SentenceDispatchBuffer(int minSentenceLength = 30)
     {
-        _minSentenceLength = minSentenceLength;
-
-        _channel = Channel.CreateUnbounded<string>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
+        _minSentenceLength = Math.Max(1, minSentenceLength);
     }
 
-    /// <summary>
-    /// Добавить токен от LLM (streaming)
-    /// </summary>
     public void AppendToken(string token)
     {
         if (string.IsNullOrEmpty(token))
             return;
 
-        lock (_lock)
-        {
-            if (_completed)
-                return;
+        _sb.Append(token);
 
-            _buffer.Append(token);
-            TryFlushSentences();
+        // сплит по . ! ? … \n
+        while (TryExtractSentence(out var s))
+            _out.Writer.TryWrite(s);
+    }
+
+    public async IAsyncEnumerable<string> GetSentencesAsync(CancellationToken ct)
+    {
+        while (await _out.Reader.WaitToReadAsync(ct))
+        {
+            while (_out.Reader.TryRead(out var s))
+                yield return s;
         }
     }
 
-    /// <summary>
-    /// Сообщить, что LLM закончил генерацию
-    /// </summary>
     public void Complete()
     {
-        lock (_lock)
-        {
-            if (_completed)
-                return;
+        // финальный хвост (если есть)
+        var tail = _sb.ToString().Trim();
+        if (!string.IsNullOrWhiteSpace(tail))
+            _out.Writer.TryWrite(tail);
 
-            _completed = true;
-
-            var tail = _buffer.ToString().Trim();
-            _buffer.Clear();
-
-            if (tail.Length >= _minSentenceLength)
-            {
-                _channel.Writer.TryWrite(tail);
-            }
-
-            _channel.Writer.TryComplete();
-        }
+        _sb.Clear();
+        _out.Writer.TryComplete();
     }
 
-    /// <summary>
-    /// Barge-in: сбросить всё немедленно
-    /// </summary>
     public void Reset()
     {
-        lock (_lock)
-        {
-            _buffer.Clear();
-            _completed = true;
-
-            _channel.Writer.TryComplete();
-        }
+        _sb.Clear();
+        while (_out.Reader.TryRead(out _)) { }
+        // канал НЕ закрываем — буфер может использоваться дальше
     }
 
-    /// <summary>
-    /// Асинхронный поток готовых предложений
-    /// </summary>
-    public IAsyncEnumerable<string> GetSentencesAsync(
-        CancellationToken cancellationToken = default)
+    private bool TryExtractSentence(out string sentence)
     {
-        return _channel.Reader.ReadAllAsync(cancellationToken);
+        sentence = "";
+
+        if (_sb.Length < _minSentenceLength)
+            return false;
+
+        var text = _sb.ToString();
+
+        int idx = FindSentenceBoundary(text);
+        if (idx < 0)
+            return false;
+
+        var part = text[..(idx + 1)].Trim();
+        var rest = text[(idx + 1)..];
+
+        if (part.Length < _minSentenceLength && !part.EndsWith("\n"))
+            return false;
+
+        sentence = NormalizeSpaces(part);
+        _sb.Clear();
+        _sb.Append(rest);
+
+        return !string.IsNullOrWhiteSpace(sentence);
     }
 
-    // ------------------------
-    // INTERNAL
-    // ------------------------
-
-    private void TryFlushSentences()
+    private static int FindSentenceBoundary(string s)
     {
-        var text = _buffer.ToString();
-
-        var matches = SentenceEndRegex.Matches(text);
-        if (matches.Count == 0)
-            return;
-
-        int lastFlushIndex = -1;
-
-        foreach (Match match in matches)
+        // берём ближайшую "концовку предложения"
+        // точка/воскл/вопр/многоточие/перевод строки
+        for (int i = 0; i < s.Length; i++)
         {
-            int end = match.Index + match.Length;
-            var sentence = text[..end].Trim();
-
-            if (sentence.Length < _minSentenceLength)
-                continue;
-
-            _channel.Writer.TryWrite(sentence);
-            lastFlushIndex = end;
+            char c = s[i];
+            if (c == '.' || c == '!' || c == '?' || c == '\n' || c == '…')
+                return i;
         }
+        return -1;
+    }
 
-        if (lastFlushIndex > 0)
-        {
-            _buffer.Remove(0, lastFlushIndex);
-        }
+    private static string NormalizeSpaces(string s)
+    {
+        // минимальная нормализация
+        return s.Replace("\r", "").Trim();
     }
 }

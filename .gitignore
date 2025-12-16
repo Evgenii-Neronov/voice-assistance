@@ -129,6 +129,7 @@ bld/
 *.vcproj.*.vcxproj.filters
 
 # Общие
+*.vs/
 .DS_Store
 Thumbs.db
 *.log
@@ -165,3 +166,4 @@ Thumbs.db
 *.csproj.user
 *.vcxproj.user
 *.vcxproj.filters
+/VoiceAgent.Gateway/.vs/VoiceAgent.Gateway/DesignTimeBuild/.dtbcache.v2

@@ -1,0 +1,19 @@
+syntax = "proto3";
+package asr;
+
+option csharp_namespace = "VoiceAgent.Asr";
+
+service Asr {
+  rpc StreamRecognize (stream AudioChunk) returns (stream AsrResult);
+}
+
+message AudioChunk {
+  bytes pcm16le = 1;
+  bool end = 2;
+  bool reset = 3;
+}
+
+message AsrResult {
+  string text = 1;
+  bool is_final = 2;
+}

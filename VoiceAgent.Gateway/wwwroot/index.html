@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>VoiceAgent UI</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 16px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    button { padding: 8px 12px; }
+    canvas { border: 1px solid #ddd; border-radius: 10px; }
+    .panel { display: grid; grid-template-columns: 360px 1fr; gap: 16px; margin-top: 14px; }
+    @media (max-width: 900px) { .panel { grid-template-columns: 1fr; } }
+    .box { border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+    .muted { color: #666; font-size: 12px; }
+    pre { white-space: pre-wrap; font-size: 16px; margin: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; vertical-align: top; }
+    th { text-align: left; position: sticky; top: 0; background: #fff; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #ddd; }
+    .tag.user { border-color: #bbb; }
+    .tag.asr { border-color: #aaa; }
+    .tag.llm { border-color: #aaa; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .scroll { max-height: 1520px; overflow: auto; }
+  </style>
+</head>
+<body>
+
+<div class="row">
+  <button id="start">Start</button>
+  <button id="interrupt">Interrupt</button>
+  <button id="stop">Stop</button>
+  <span class="muted">WS: <span id="wsState">disconnected</span></span>
+  <span class="muted">UI-VAD: <span id="vadState">idle</span></span>
+</div>
+
+<div class="panel">
+  <div class="box">
+    <div class="row" style="justify-content: space-between;">
+      <div><b>Эквалайзер (микрофон)</b></div>
+      <div class="muted">16 kHz PCM → WS → gRPC → ASR → LLM</div>
+    </div>
+
+    <canvas id="eq" width="340" height="120" style="margin-top:10px;"></canvas>
+
+    <div class="muted" style="margin-top:10px;">
+      Эквалайзер — чисто UI. Детект “говорит/молчит” — локальный RMS.
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee;margin:12px 0;">
+
+    <b>Текущий текст</b>
+    <pre id="out" style="margin-top:8px;"></pre>
+  </div>
+
+  <div class="box">
+    <div class="row" style="justify-content: space-between;">
+      <div><b>Лог событий</b></div>
+      <button id="clear">Clear</button>
+    </div>
+
+    <div class="scroll" style="margin-top:10px;">
+      <table>
+        <thead>
+        <tr>
+          <th style="width:140px;">Время</th>
+          <th style="width:90px;">Источник</th>
+          <th>Событие / Текст</th>
+          <th style="width:90px;">Δ, сек</th>
+        </tr>
+        </thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div>
+
+    <div class="muted" style="margin-top:10px;">
+      Δ — разница со строкой выше (ASR_FINAL → LLM_FIRST_TOKEN → LLM_FINAL).
+    </div>
+  </div>
+</div>
+
+<script>
+let ws, audioCtx, processor, input, stream;
+let analyser, rafId;
+let speaking = false;
+let lastEventTs = null;
+let lastBargeInTs = 0;
+let llmFirstTokenSeenForTurn = false;
+
+const out = document.getElementById("out");
+const wsState = document.getElementById("wsState");
+const vadState = document.getElementById("vadState");
+const logBody = document.getElementById("logBody");
+const eq = document.getElementById("eq");
+const eqCtx = eq.getContext("2d");
+
+function nowTs() { return Date.now(); }
+
+function sendBargeIn(reason) {
+  const ts = nowTs();
+  if (ts - lastBargeInTs < 800) return; // debounce
+  lastBargeInTs = ts;
+
+  if (ws && ws.readyState === 1) {
+    addLog("USER", `BARGE_IN: ${reason}`);
+    ws.send("barge_in");
+  }
+}
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString("ru-RU", { hour12: false }) + "." +
+         String(d.getMilliseconds()).padStart(3, "0");
+}
+
+function addLog(source, text, ts = nowTs()) {
+  const delta = lastEventTs ? ((ts - lastEventTs) / 1000).toFixed(3) : "";
+  lastEventTs = ts;
+
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td>${fmtTime(ts)}</td>
+    <td><span class="tag ${source.toLowerCase()}">${source}</span></td>
+    <td>${text}</td>
+    <td>${delta}</td>
+  `;
+  logBody.appendChild(tr);
+  logBody.parentElement.parentElement.scrollTop = logBody.scrollHeight;
+}
+
+function setOut(t) { out.textContent = t; }
+function setWsState(t) { wsState.textContent = t; }
+function setVadState(t) { vadState.textContent = t; }
+
+function drawEq() {
+  if (!analyser) return;
+
+  const freq = new Uint8Array(analyser.frequencyBinCount);
+  analyser.getByteFrequencyData(freq);
+
+  eqCtx.clearRect(0, 0, eq.width, eq.height);
+
+  const bars = 48;
+  const step = Math.floor(freq.length / bars);
+  const barW = (eq.width - 10) / bars;
+
+  for (let i = 0; i < bars; i++) {
+    const v = freq[i * step] / 255;
+    const h = v * (eq.height - 10);
+    eqCtx.fillRect(5 + i * barW, eq.height - 5 - h, barW - 2, h);
+  }
+
+  const tbuf = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(tbuf);
+
+  let sum = 0;
+  for (let i = 0; i < tbuf.length; i++) {
+    const s = (tbuf[i] - 128) / 128;
+    sum += s * s;
+  }
+
+  const rms = Math.sqrt(sum / tbuf.length);
+  const threshold = 0.035;
+  const silenceHoldMs = 550;
+  const ts = nowTs();
+
+  if (!window.__vad) window.__vad = { lastSpeechTs: 0 };
+
+  if (rms >= threshold) {
+    window.__vad.lastSpeechTs = ts;
+    if (!speaking) {
+      speaking = true;
+      setVadState("speaking");
+      addLog("USER", "Пользователь начал говорить");
+      sendBargeIn("vad_start");
+    }
+  } else if (speaking && ts - window.__vad.lastSpeechTs > silenceHoldMs) {
+    speaking = false;
+    setVadState("silent");
+    addLog("USER", "Пользователь замолчал");
+  } else if (!speaking) {
+    setVadState("idle");
+  }
+
+  rafId = requestAnimationFrame(drawEq);
+}
+
+async function start() {
+  llmFirstTokenSeenForTurn = false;
+  lastEventTs = null;
+  addLog("USER", "Start");
+
+  ws = new WebSocket("ws://localhost:5079/ws");
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => { setWsState("connected"); addLog("USER", "WS connected"); };
+  ws.onclose = () => { setWsState("disconnected"); addLog("USER", "WS closed"); };
+
+  ws.onmessage = e => {
+    const msg = e.data;
+
+    if (msg === "BARGE_IN_ACK") {
+      addLog("LLM", "BARGE_IN_ACK");
+      llmFirstTokenSeenForTurn = false;
+      return;
+    }
+
+    if (msg === "TTS_STOP") {
+      addLog("LLM", "TTS_STOP");
+      return;
+    }
+
+    if (msg === "LLM_FINAL") {
+      addLog("LLM", "LLM завершила ответ");
+      llmFirstTokenSeenForTurn = false;
+      return;
+    }
+
+    if (msg.startsWith("METRIC:")) {
+      addLog("LLM", msg.substring(7));
+      return;
+    }
+
+    if (msg.startsWith("ASR_PART:")) {
+      const t = msg.substring(9);
+      addLog("ASR", `PART: ${t}`);
+      setOut(t);
+      return;
+    }
+
+    if (msg.startsWith("ASR_FINAL:")) {
+      const t = msg.substring(10);
+      addLog("ASR", `FINAL: ${t}`);
+      setOut(t + "\n");
+      llmFirstTokenSeenForTurn = false;
+      return;
+    }
+
+    if (msg.startsWith("LLM_PART:")) {
+      const t = msg.substring(9);
+      if (!llmFirstTokenSeenForTurn) {
+        addLog("LLM", "LLM: первый токен");
+        llmFirstTokenSeenForTurn = true;
+      }
+      setOut(out.textContent + t);
+    }
+  };
+
+  stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  audioCtx = new AudioContext({ sampleRate: 16000 });
+
+  input = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = e => {
+    const d = e.inputBuffer.getChannelData(0);
+    const pcm = new Int16Array(d.length);
+    for (let i = 0; i < d.length; i++) {
+      const s = Math.max(-1, Math.min(1, d[i]));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    if (ws.readyState === 1) ws.send(pcm.buffer);
+  };
+
+  input.connect(analyser);
+  analyser.connect(processor);
+  processor.connect(audioCtx.destination);
+
+  rafId = requestAnimationFrame(drawEq);
+  addLog("USER", "Audio started");
+}
+
+function stop() {
+  addLog("USER", "Stop");
+  cancelAnimationFrame(rafId);
+  stream?.getTracks().forEach(t => t.stop());
+  audioCtx?.close();
+  ws?.close();
+  speaking = false;
+  setVadState("idle");
+}
+
+document.getElementById("start").onclick = start;
+document.getElementById("interrupt").onclick = () => ws?.send("reset");
+document.getElementById("stop").onclick = stop;
+document.getElementById("clear").onclick = () => { logBody.innerHTML = ""; lastEventTs = null; };
+</script>
+
+</body>
+</html>

@@ -97,22 +97,18 @@ app.Map("/ws", async ctx =>
 
     async Task BargeIn(string reason)
     {
-        // барж-ин = новая “эпоха”: увеличиваем счетчик turnSeq
         var newSeq = Interlocked.Increment(ref turnSeq);
 
         CancelLlm(reason);
 
         currentTurn?.User.MarkInterrupted();
-=
+
         tts.Stop(newSeq, reason);
 
         await WsSend(ws, "BARGE_IN_ACK", shutdown);
         await WsSend(ws, "TTS_STOP", shutdown);
     }
 
-    // =========================
-    // ASR RECEIVE
-    // =========================
     _ = Task.Run(async () =>
     {
         try

@@ -52,7 +52,6 @@ public sealed class SentenceDispatchBuffer
     {
         _sb.Clear();
         while (_out.Reader.TryRead(out _)) { }
-        // канал НЕ закрываем — буфер может использоваться дальше
     }
 
     private bool TryExtractSentence(out string sentence)

@@ -11,12 +11,10 @@ using Grpc.Core;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// SERVICES
 builder.Services.AddHttpClient<OllamaStreamer>();
 
 var app = builder.Build();
 
-// Ctrl+C
 var lifetime = app.Services.GetRequiredService<IHostApplicationLifetime>();
 var shutdownCts = new CancellationTokenSource();
 lifetime.ApplicationStopping.Register(() =>

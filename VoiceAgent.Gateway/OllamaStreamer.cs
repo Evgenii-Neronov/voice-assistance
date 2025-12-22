@@ -45,7 +45,6 @@ public sealed class OllamaStreamer
         {
             string? line;
 
-            // Read line with proper cancellation
             try
             {
                 line = await reader.ReadLineAsync().WaitAsync(cancellationToken);

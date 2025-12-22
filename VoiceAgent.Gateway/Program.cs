@@ -58,20 +58,16 @@ app.Map("/ws", async ctx =>
 Пиши обычным текстом. Не повторяйся. В первую очередь учитывай последние вопросы и просьбы.
 Если тебя прервали речью пользователя, не извиняйся и не упоминай прерывание.
 Если пользователь продолжает мысль, учитывай предыдущие реплики.
+Если вопросов несколько - отвечай только на последний вопрос.
+Если просят рассказать потробно - то отвечай максимально длинно и подробно.
 """;
 
     var promptBuilder = new DialogPromptBuilder(SystemPrompt, maxTurns: 10, maxChars: 12_000);
 
-    // =========================
-    // STATE
-    // =========================
     long turnSeq = 0;
     TurnState? currentTurn = null;
     CancellationTokenSource? llmCts = null;
 
-    // =========================
-    // TTS
-    // =========================
     var tts = new TtsWorker(
         ws,
         piperExeWsl: "/home/adv/bin/piper/piper",
@@ -80,9 +76,6 @@ app.Map("/ws", async ctx =>
 
     tts.Start();
 
-    // =========================
-    // ASR
-    // =========================
     var channel = GrpcChannel.ForAddress("http://localhost:50051");
     var asr = new Asr.AsrClient(channel);
     using var asrCall = asr.StreamRecognize();

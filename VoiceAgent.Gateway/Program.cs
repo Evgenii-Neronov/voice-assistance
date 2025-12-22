@@ -124,7 +124,6 @@ app.Map("/ws", async ctx =>
                     continue;
                 }
 
-                // ===== ASR FINAL => новый turn =====
                 var turnId = Interlocked.Increment(ref turnSeq);
 
                 // Создаём новый turn state

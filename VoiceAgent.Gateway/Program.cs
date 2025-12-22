@@ -103,9 +103,7 @@ app.Map("/ws", async ctx =>
         CancelLlm(reason);
 
         currentTurn?.User.MarkInterrupted();
-
-        // Важно: синхронизировать TTS-guard с новым turnSeq,
-        // иначе очередь будет считаться stale.
+=
         tts.Stop(newSeq, reason);
 
         await WsSend(ws, "BARGE_IN_ACK", shutdown);

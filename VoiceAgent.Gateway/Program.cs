@@ -72,7 +72,7 @@ app.Map("/ws", async ctx =>
         ws,
         piperExeWsl: "/home/adv/bin/piper/piper",
         modelWsl: "/home/adv/tts/ru_RU-irina-medium.onnx",
-        configWsl: "/home/adv/tts/ru_RU-irina-medium.onnx.json");
+        configWsl: "/home/adv/tts/ru_RU-irina-medium.onnx.json"); 
 
     tts.Start();
 

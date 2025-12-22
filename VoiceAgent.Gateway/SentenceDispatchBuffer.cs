@@ -95,7 +95,6 @@ public sealed class SentenceDispatchBuffer
 
     private static string NormalizeSpaces(string s)
     {
-        // минимальная нормализация
         return s.Replace("\r", "").Trim();
     }
 }

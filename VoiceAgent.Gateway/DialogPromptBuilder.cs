@@ -17,7 +17,7 @@ public sealed class DialogPromptBuilder
 
     /// <summary>
     /// Собирает prompt для LLM:
-    /// SYSTEM + последние N turn'ов (только то, что пользователь реально слышал) + текущий ASR_FINAL.
+    /// SYSTEM + последние N turn'ов (только то, что пользователь реально слышал) + текущий ASR_FINAL. 
     /// </summary>
     public string Build(IReadOnlyList<TurnState> history, string currentUserText)
     {

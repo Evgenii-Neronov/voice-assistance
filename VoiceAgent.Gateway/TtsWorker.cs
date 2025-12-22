@@ -37,7 +37,7 @@ public sealed class TtsWorker : IAsyncDisposable
     public void Start()
     {
         Console.WriteLine("[TTS] Worker started");
-        _ = Task.Run(LoopAsync);
+        _ = Task.Run(LoopAsync); 
     }
 
     public void StartTurn(long turnId)

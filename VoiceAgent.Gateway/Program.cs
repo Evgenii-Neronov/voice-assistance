@@ -46,10 +46,6 @@ app.Map("/ws", async ctx =>
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
     Console.WriteLine("[WS] connected");
 
-    // =========================
-    // DIALOG HISTORY + PROMPT
-    // =========================
-    // Храним последние turn'ы (можно увеличить)
     var dialogHistory = new List<TurnState>(capacity: 64);
 
     // System prompt (один на всё)

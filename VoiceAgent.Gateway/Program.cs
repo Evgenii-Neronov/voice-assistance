@@ -126,7 +126,6 @@ app.Map("/ws", async ctx =>
 
                 var turnId = Interlocked.Increment(ref turnSeq);
 
-                // Создаём новый turn state
                 currentTurn = new TurnState(turnId);
                 currentTurn.User.MarkFinal(res.Text);
 
